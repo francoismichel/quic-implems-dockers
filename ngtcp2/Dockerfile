@@ -9,7 +9,7 @@ RUN apt-get update && \
         ca-certificates mime-support && \
     git clone --depth 1 -b OpenSSL_1_1_1g-quic-draft-29 https://github.com/tatsuhiro-t/openssl && \
     cd openssl && ./config enable-tls1_3 --openssldir=/etc/ssl && make -j$(nproc) && make install_sw && cd .. && \
-    git clone --depth 1 https://github.com/ngtcp2/nghttp3 && \
+    git clone --branch draft-29 --depth 1 https://github.com/ngtcp2/nghttp3 && \
     cd nghttp3 && autoreconf -i && \
     ./configure --enable-lib-only && \
     make -j$(nproc) && make install-strip && cd ..
