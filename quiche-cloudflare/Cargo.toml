@@ -2,7 +2,7 @@
 name = "quiche-generic-client-server"
 version = "0.1.0"
 authors = ["François Michel <francois.michel@uclouvain.be>"]
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -31,4 +31,4 @@ env_logger = { version = "0.8.1" }
 docopt = "1"
 serde = { version = "1", features = ["derive"] }
 rand = "0.7"
-quiche = { git = "https://github.com/cloudflare/quiche", rev = "18a682b" }
+quiche = { git = "https://github.com/cloudflare/quiche", rev = "ba87786" }

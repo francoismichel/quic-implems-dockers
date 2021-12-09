@@ -24,7 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use log::{trace, debug, warn, error, info};
+#[macro_use]
+extern crate log;
 
 use std::net;
 
@@ -52,7 +53,7 @@ struct Client {
     partial_responses: HashMap<u64, PartialResponse>,
 }
 
-type ClientMap = HashMap<Vec<u8>, (net::SocketAddr, Client)>;
+type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
 
 const USAGE: &str = "Usage:
@@ -67,10 +68,9 @@ Options:
   -h --help                 Show this screen.
 ";
 
-const MAX_REQUEST_SIZE: usize = 150000000;
+const MAX_REQUEST_SIZE: usize = 5000000000;
 
 fn main() {
-
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -93,6 +93,7 @@ fn main() {
         let a: u8 = rand::random();
         random_buffer.push(a);
     }
+
 
     // Setup the event loop.
     let poll = mio::Poll::new().unwrap();
@@ -125,7 +126,8 @@ fn main() {
         .unwrap();
 
     config.set_max_idle_timeout(5000);
-    config.set_max_udp_payload_size(MAX_DATAGRAM_SIZE as u64);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
@@ -147,8 +149,7 @@ fn main() {
         // Find the shorter timeout from all the active connections.
         //
         // TODO: use event loop that properly supports timers
-        let timeout =
-            clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
+        let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
 
         poll.poll(&mut events, timeout).unwrap();
 
@@ -161,12 +162,12 @@ fn main() {
             if events.is_empty() {
                 debug!("timed out");
 
-                clients.values_mut().for_each(|(_, c)| c.conn.on_timeout());
+                clients.values_mut().for_each(|c| c.conn.on_timeout());
 
                 break 'read;
             }
 
-            let (len, src) = match socket.recv_from(&mut buf) {
+            let (len, from) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -202,11 +203,12 @@ fn main() {
 
             let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
             let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
+            let conn_id = conn_id.to_vec().into();
 
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
-            let (_, client) = if !clients.contains_key(&hdr.dcid) &&
-                !clients.contains_key(conn_id)
+            let client = if !clients.contains_key(&hdr.dcid) &&
+                !clients.contains_key(&conn_id)
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
@@ -222,7 +224,7 @@ fn main() {
 
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, &src) {
+                    if let Err(e) = socket.send_to(out, &from) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send() would block");
                             break;
@@ -236,6 +238,8 @@ fn main() {
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
                 scid.copy_from_slice(&conn_id);
 
+                let scid = quiche::ConnectionId::from_ref(&scid);
+
                 // Token is always present in Initial packets.
                 let token = hdr.token.as_ref().unwrap();
 
@@ -243,7 +247,7 @@ fn main() {
                 if token.is_empty() {
                     warn!("Doing stateless retry");
 
-                    let new_token = mint_token(&hdr, &src);
+                    let new_token = mint_token(&hdr, &from);
 
                     let len = quiche::retry(
                         &hdr.scid,
@@ -257,7 +261,7 @@ fn main() {
 
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, &src) {
+                    if let Err(e) = socket.send_to(out, &from) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send() would block");
                             break;
@@ -268,11 +272,11 @@ fn main() {
                     continue 'read;
                 }
 
-                let odcid = validate_token(&src, token);
+                let odcid = validate_token(&from, token);
 
                 // The token was not valid, meaning the retry failed, so
                 // drop the packet.
-                if odcid == None {
+                if odcid.is_none() {
                     error!("Invalid address validation token");
                     continue 'read;
                 }
@@ -282,17 +286,15 @@ fn main() {
                     continue 'read;
                 }
 
-                // Reuse the source connection ID we sent in the Retry
-                // packet, instead of changing it again.
-                scid.copy_from_slice(&hdr.dcid);
+                // Reuse the source connection ID we sent in the Retry packet,
+                // instead of changing it again.
+                let scid = hdr.dcid.clone();
 
-                debug!(
-                    "New connection: dcid={} scid={}",
-                    hex_dump(&hdr.dcid),
-                    hex_dump(&scid)
-                );
+                debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn = quiche::accept(&scid, odcid, &mut config).unwrap();
+                let conn =
+                    quiche::accept(&scid, odcid.as_ref(), from, &mut config)
+                        .unwrap();
 
                 let client = Client {
                     conn,
@@ -300,19 +302,21 @@ fn main() {
                     partial_responses: HashMap::new(),
                 };
 
-                clients.insert(scid.to_vec(), (src, client));
+                clients.insert(scid.clone(), client);
 
-                clients.get_mut(&scid[..]).unwrap()
+                clients.get_mut(&scid).unwrap()
             } else {
                 match clients.get_mut(&hdr.dcid) {
                     Some(v) => v,
 
-                    None => clients.get_mut(conn_id).unwrap(),
+                    None => clients.get_mut(&conn_id).unwrap(),
                 }
             };
 
+            let recv_info = quiche::RecvInfo { from };
+
             // Process potentially coalesced packets.
-            let read = match client.conn.recv(pkt_buf) {
+            let read = match client.conn.recv(pkt_buf, recv_info) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -382,6 +386,8 @@ fn main() {
 
                         Ok((_stream_id, quiche::h3::Event::Finished)) => (),
 
+                        Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
+
                         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 
                         Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
@@ -407,9 +413,9 @@ fn main() {
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
-        for (peer, client) in clients.values_mut() {
+        for client in clients.values_mut() {
             loop {
-                let write = match client.conn.send(&mut out) {
+                let (write, send_info) = match client.conn.send(&mut out) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
@@ -425,8 +431,7 @@ fn main() {
                     },
                 };
 
-                // TODO: coalesce packets.
-                if let Err(e) = socket.send_to(&out[..write], &peer) {
+                if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("send() would block");
                         break;
@@ -440,7 +445,7 @@ fn main() {
         }
 
         // Garbage collect closed connections.
-        clients.retain(|_, (_, ref mut c)| {
+        clients.retain(|_, ref mut c| {
             debug!("Collecting garbage");
 
             if c.conn.is_closed() {
@@ -489,7 +494,7 @@ fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
 /// authenticate of the token. *It should not be used in production system*.
 fn validate_token<'a>(
     src: &net::SocketAddr, token: &'a [u8],
-) -> Option<&'a [u8]> {
+) -> Option<quiche::ConnectionId<'a>> {
     if token.len() < 6 {
         return None;
     }
@@ -509,9 +514,7 @@ fn validate_token<'a>(
         return None;
     }
 
-    let token = &token[addr.len()..];
-
-    Some(&token[..])
+    Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
 /// Handles incoming HTTP/3 requests.
@@ -559,6 +562,8 @@ fn handle_request(
     let written = match http3_conn.send_body(conn, stream_id, &body, true) {
         Ok(v) => v,
 
+        Err(quiche::h3::Error::Done) => 0,
+
         Err(e) => {
             error!("{} stream send failed {:?}", conn.trace_id(), e);
             return;
@@ -579,26 +584,23 @@ fn handle_request(
 /// Builds an HTTP/3 response given a request.
 fn build_random_response(request: &[quiche::h3::Header], generator: &Vec<u8>,
 ) -> (Vec<quiche::h3::Header>, Vec<u8>) {
-    let mut method = "";
     let mut path_str = "";
+    let mut method = None;
 
     // Look for the request's path and method.
     for hdr in request {
         match hdr.name() {
-            ":path" => {
-                path_str = hdr.value();
-            },
+            b":path" =>
+                path_str = std::str::from_utf8(hdr.value()).unwrap(),
 
-            ":method" => {
-                method = hdr.value();
-            },
+            b":method" => method = Some(hdr.value()),
 
             _ => (),
         }
     }
 
     let (status, body) = match method {
-        "GET" => {
+        Some(b"GET") => {
             let mut path_string = path_str.to_string();
             if path_string.remove(0) == '/' {
                 let request_size = usize::from_str_radix(path_string.as_str(), 10).unwrap();
@@ -607,7 +609,6 @@ fn build_random_response(request: &[quiche::h3::Header], generator: &Vec<u8>,
                     while res.len() < request_size {
                         res.extend_from_slice(&generator[0..std::cmp::min(generator.len(), request_size - res.len())])
                     }
-                    // (200, (Vec::from_iter(generator[0..request_size].iter().cloned())))
                     (200, res)
                 } else {
                     (404, b"Not Found!".to_vec())
@@ -621,9 +622,12 @@ fn build_random_response(request: &[quiche::h3::Header], generator: &Vec<u8>,
     };
 
     let headers = vec![
-        quiche::h3::Header::new(":status", &status.to_string()),
-        quiche::h3::Header::new("server", "quiche"),
-        quiche::h3::Header::new("content-length", &body.len().to_string()),
+        quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
+        quiche::h3::Header::new(b"server", b"quiche"),
+        quiche::h3::Header::new(
+            b"content-length",
+            body.len().to_string().as_bytes(),
+        ),
     ];
 
     (headers, body)
@@ -643,7 +647,7 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     let resp = client.partial_responses.get_mut(&stream_id).unwrap();
 
     if let Some(ref headers) = resp.headers {
-        match http3_conn.send_response(conn, stream_id, &headers, false) {
+        match http3_conn.send_response(conn, stream_id, headers, false) {
             Ok(_) => (),
 
             Err(quiche::h3::Error::StreamBlocked) => {
@@ -664,7 +668,11 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     let written = match http3_conn.send_body(conn, stream_id, body, true) {
         Ok(v) => v,
 
+        Err(quiche::h3::Error::Done) => 0,
+
         Err(e) => {
+            client.partial_responses.remove(&stream_id);
+
             error!("{} stream send failed {:?}", conn.trace_id(), e);
             return;
         },
@@ -675,12 +683,6 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     if resp.written == resp.body.len() {
         client.partial_responses.remove(&stream_id);
     }
-}
-
-fn hex_dump(buf: &[u8]) -> String {
-    let vec: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
-
-    vec.join("")
 }
 
 
