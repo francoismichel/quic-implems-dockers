@@ -28,11 +28,13 @@
 extern crate log;
 
 use std::net::ToSocketAddrs;
+use std::str::FromStr;
 
 use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+const MAX_REQUEST_SIZE: usize = 5000000000;
 
 
 const USAGE: &str = "Usage:
@@ -42,6 +44,7 @@ const USAGE: &str = "Usage:
 Options:
   -X PATH                  The path of the keylog file on which to dump the TLS keys [default: ./keys.log]
   -G BYTES                 The size of the request to perform [default: 50000]
+  -U                       If set, do an upload instead of a download.
   --wire-version VERSION   The version number to send to the server [default: 00000001].
   -verify                  If set, verifies the remote certificate
   -h --help                Show this screen.
@@ -59,6 +62,23 @@ fn main() {
     println!("{}", url);
     let url = url::Url::parse(url.as_str()).unwrap();
 
+    let capacity = if args.upload { args.request_size } else { 1 };
+    let mut random_upload_buffer =  Vec::<u8>::with_capacity(capacity);
+
+    if args.upload {
+        let mut tmp = Vec::<u8>::with_capacity(500000);
+        for _ in 0..tmp.capacity() {
+            let a: u8 = rand::random();
+            tmp.push(a);
+        }
+        while random_upload_buffer.len() < args.request_size {
+            random_upload_buffer.extend_from_slice(&tmp[0..std::cmp::min(tmp.len(), args.request_size - random_upload_buffer.len())])
+        }
+    }
+
+    if args.request_size > MAX_REQUEST_SIZE {
+        panic!("too large request size !");
+    }
 
     // Setup the event loop.
     let poll = mio::Poll::new().unwrap();
@@ -171,8 +191,17 @@ fn main() {
         path.push_str(query);
     }
 
+    let post = b"POST";
+    let get = b"GET";
+
+    let method = if args.upload {
+        &post[..]
+    } else {
+        &get[..]
+    };
+
     let req = vec![
-        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":method", method),
         quiche::h3::Header::new(b":scheme", url.scheme().as_bytes()),
         quiche::h3::Header::new(
             b":authority",
@@ -188,7 +217,10 @@ fn main() {
 
     let mut total_bytes: usize = 0;
 
+    let mut req_upload_bytes_sent = 0;
+    let mut req_headers_sent = false;
     let mut req_sent = false;
+    let mut post_request_stream_id = None;
 
     loop {
         poll.poll(&mut events, conn.timeout()).unwrap();
@@ -259,10 +291,26 @@ fn main() {
         if let Some(h3_conn) = &mut http3_conn {
             if !req_sent {
                 info!("sending HTTP request {:?}", req);
+                if !req_headers_sent {
+                    post_request_stream_id = Some(h3_conn.send_request(&mut conn, &req, false).unwrap());
+                    req_headers_sent = true;
+                }
 
-                h3_conn.send_request(&mut conn, &req, true).unwrap();
-
-                req_sent = true;
+                if args.upload {
+                    if args.request_size > 0 && args.request_size < MAX_REQUEST_SIZE && req_upload_bytes_sent < args.request_size {
+                        if let Some(stream_id) = post_request_stream_id {
+                            match h3_conn.send_body(&mut conn, stream_id, &random_upload_buffer[req_upload_bytes_sent..], true) {
+                                Ok(n) => req_upload_bytes_sent += n,
+                                Err(quiche::h3::Error::Done) => {},
+                                Err(e) => panic!("error in send_body: {:?}", e),
+                            };
+                            info!("{}/{}", req_upload_bytes_sent, args.request_size);
+                        }
+                    }
+                }
+                if req_upload_bytes_sent == args.request_size {
+                    req_sent = true;
+                }
             }
         }
 
@@ -287,6 +335,10 @@ fn main() {
                             );
 
                             total_bytes += read;
+
+                            if args.upload {
+                                println!("server reported receiving {} bytes", u64::from_str(unsafe { std::str::from_utf8_unchecked(&buf[..read]) } ).unwrap())
+                            }
 
                         }
                     },
@@ -380,7 +432,8 @@ fn hex_dump(buf: &[u8]) -> String {
 /// Application-specific arguments that compliment the `CommonArgs`.
 struct ClientArgs {
     version: u32,
-    request_size: u32,
+    request_size: usize,
+    upload: bool,
     no_verify: bool,
     keylog_path: String,
     address: String,
@@ -400,11 +453,13 @@ impl Args for ClientArgs {
         let version = u32::from_str_radix(version, 16).unwrap();
 
         let request_size = args.get_str("-G");
-        let request_size = u32::from_str_radix(request_size, 10).unwrap();
+        let request_size = usize::from_str_radix(request_size, 10).unwrap();
 
         let keylog_path = args.get_str("-X").to_string();
 
         let no_verify = !args.get_bool("-verify");
+
+        let upload = args.get_bool("-U");
 
         let address = args.get_str("ADDRESS").to_string();
         let port = args.get_str("PORT");
@@ -413,6 +468,7 @@ impl Args for ClientArgs {
             version,
             request_size,
             no_verify,
+            upload,
             keylog_path,
             address,
             port,

@@ -145,6 +145,8 @@ fn main() {
 
     let mut clients = ClientMap::new();
 
+    let mut total_read_bytes = 0;
+
     loop {
         // Find the shorter timeout from all the active connections.
         //
@@ -382,6 +384,33 @@ fn main() {
                                 client.conn.trace_id(),
                                 stream_id
                             );
+                            loop {
+                                match http3_conn.recv_body(&mut client.conn, stream_id, &mut buf) {
+                                    Ok(n) => {
+                                        total_read_bytes += n;
+                                        info!("total read {} bytes", total_read_bytes);
+                                    },
+                                    Err(quiche::h3::Error::Done) => {
+                                        break;
+                                    },
+                                    Err(e) => {
+                                        panic!("recv_body failed: {:?}", e);
+                                    }
+                                }
+                            }
+                            if client.conn.stream_finished(stream_id) {
+                                let body_str = format!("{}", total_read_bytes);
+                                let body = body_str.as_bytes();
+                                let headers = vec![
+                                    quiche::h3::Header::new(b":status", 200.to_string().as_bytes()),
+                                    quiche::h3::Header::new(b"server", b"quiche"),
+                                    quiche::h3::Header::new(
+                                        b"content-length",
+                                        body.len().to_string().as_bytes(),
+                                    ),
+                                ];
+                                write_response(client, stream_id, headers, body.to_vec());
+                            }
                         },
 
                         Ok((_stream_id, quiche::h3::Event::Finished)) => (),
@@ -517,27 +546,10 @@ fn validate_token<'a>(
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
-/// Handles incoming HTTP/3 requests.
-fn handle_request(
-    client: &mut Client, stream_id: u64, headers: &[quiche::h3::Header], generator: &Vec<u8>,
-) {
+fn write_response(client: &mut Client, stream_id: u64, headers: Vec<quiche::h3::Header>, body: Vec<u8>) {
+
     let conn = &mut client.conn;
     let http3_conn = &mut client.http3_conn.as_mut().unwrap();
-
-    info!(
-        "{} got request {:?} on stream id {}",
-        conn.trace_id(),
-        headers,
-        stream_id
-    );
-
-    // We decide the response based on headers alone, so stop reading the
-    // request stream so that any body is ignored and pointless Data events
-    // are not generated.
-    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
-        .unwrap();
-
-    let (headers, body) = build_random_response(headers, generator);
 
     match http3_conn.send_response(conn, stream_id, &headers, false) {
         Ok(v) => v,
@@ -579,6 +591,50 @@ fn handle_request(
 
         client.partial_responses.insert(stream_id, response);
     }
+}
+
+/// Handles incoming HTTP/3 requests.
+fn handle_request(
+    client: &mut Client, stream_id: u64, headers: &[quiche::h3::Header], generator: &Vec<u8>,
+) {
+    let conn = &mut client.conn;
+
+    info!(
+        "{} got request {:?} on stream id {}",
+        conn.trace_id(),
+        headers,
+        stream_id
+    );
+
+    // Look for the request's path and method.
+    for hdr in headers {
+        match hdr.name() {
+
+            b":method" => {
+                if hdr.value() == b"POST" {
+                    // // We decide the response based on headers alone, so stop reading the
+                    // // request stream so that any body is ignored and pointless Data events
+                    // // are not generated.
+                    // conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+                    //     .unwrap();
+                    return;
+                }
+                // method = Some(hdr.value())
+            },
+
+            _ => (),
+        }
+    }
+
+    // // We decide the response based on headers alone, so stop reading the
+    // // request stream so that any body is ignored and pointless Data events
+    // // are not generated.
+    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+        .unwrap();
+
+    let (headers, body) = build_random_response(headers, generator);
+
+    write_response(client, stream_id, headers, body);
 }
 
 /// Builds an HTTP/3 response given a request.
